@@ -53,16 +53,53 @@ router.post('/generate-code', async (req, res) => {
 
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     
-    // Check if already generating
-    if (pairCodeRequests.has(sanitizedNumber)) {
-        return res.status(409).json({ 
-            success: false, 
-            error: 'Code generation already in progress for this number' 
-        });
-    }
-
-    const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
-    await fs.ensureDir(sessionPath);
+    try {
+        // ✅ Step 1: Check if bot is currently active
+        if (activeSockets.has(sanitizedNumber)) {
+            console.log(`🔄 Disconnecting active bot: ${sanitizedNumber}`);
+            const oldSocket = activeSockets.get(sanitizedNumber);
+            try {
+                oldSocket.ws.close();
+            } catch (e) {
+                console.log('Socket already closed');
+            }
+            activeSockets.delete(sanitizedNumber);
+        }
+        
+        // ✅ Step 2: Remove from pending requests
+        if (pairCodeRequests.has(sanitizedNumber)) {
+            const oldRequest = pairCodeRequests.get(sanitizedNumber);
+            try {
+                oldRequest.socket.ws.close();
+            } catch (e) {
+                console.log('Old request socket already closed');
+            }
+            pairCodeRequests.delete(sanitizedNumber);
+        }
+        
+        // ✅ Step 3: Delete old session from MongoDB
+        const db = await initMongo();
+        const collection = db.collection('sessions');
+        const existingSession = await collection.findOne({ number: sanitizedNumber });
+        
+        if (existingSession) {
+            console.log(`🗑️ Deleting old session from DB: ${sanitizedNumber}`);
+            await collection.deleteOne({ number: sanitizedNumber });
+        }
+        
+        // ✅ Step 4: Delete old session files
+        const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
+        if (fs.existsSync(sessionPath)) {
+            console.log(`🗑️ Deleting old session files: ${sessionPath}`);
+            await fs.remove(sessionPath);
+        }
+        
+        // ✅ Step 5: Wait a moment for cleanup
+        await delay(2000);
+        
+        // ✅ Step 6: Create fresh session directory
+        await fs.ensureDir(sessionPath);
+        console.log(`✅ Creating fresh session for: ${sanitizedNumber}`);
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     const logger = pino({ level: 'silent' });
@@ -129,6 +166,22 @@ router.post('/generate-code', async (req, res) => {
                 
                 // Store in active sockets
                 activeSockets.set(sanitizedNumber, socket);
+                
+                // Mark as new session in DB
+                try {
+                    const collection = db.collection('sessions');
+                    await collection.updateOne(
+                        { number: sanitizedNumber },
+                        { 
+                            $set: { 
+                                isNewSession: true,
+                                connectedAt: new Date()
+                            } 
+                        }
+                    );
+                } catch (e) {
+                    console.log('Failed to mark new session:', e.message);
+                }
             }
             
             if (connection === 'close') {
@@ -136,8 +189,18 @@ router.post('/generate-code', async (req, res) => {
                 
                 if (statusCode === DisconnectReason.loggedOut) {
                     console.log(`❌ Logged out: ${sanitizedNumber}`);
+                    
+                    // Complete cleanup on logout
                     await fs.remove(sessionPath);
                     pairCodeRequests.delete(sanitizedNumber);
+                    activeSockets.delete(sanitizedNumber);
+                    
+                    try {
+                        const collection = db.collection('sessions');
+                        await collection.deleteOne({ number: sanitizedNumber });
+                    } catch (e) {
+                        console.log('DB cleanup failed:', e.message);
+                    }
                 }
             }
         });
@@ -176,7 +239,7 @@ router.post('/generate-code', async (req, res) => {
 // STEP 2: Connect Bot Using Saved Session
 // ============================================
 router.post('/connect', async (req, res) => {
-    const { number } = req.body;
+    const { number, force } = req.body;
     
     if (!number) {
         return res.status(400).json({ 
@@ -187,16 +250,29 @@ router.post('/connect', async (req, res) => {
 
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     
-    // Check if already connected
-    if (activeSockets.has(sanitizedNumber)) {
-        return res.status(409).json({ 
-            success: false, 
-            error: 'Bot is already connected for this number' 
-        });
-    }
-
     try {
-        // Restore session from MongoDB
+        // ✅ Check if already connected
+        if (activeSockets.has(sanitizedNumber)) {
+            if (force === true) {
+                console.log(`🔄 Force reconnecting: ${sanitizedNumber}`);
+                const oldSocket = activeSockets.get(sanitizedNumber);
+                try {
+                    oldSocket.ws.close();
+                } catch (e) {
+                    console.log('Old socket already closed');
+                }
+                activeSockets.delete(sanitizedNumber);
+                await delay(2000);
+            } else {
+                return res.status(200).json({ 
+                    success: true, 
+                    alreadyConnected: true,
+                    message: 'Bot is already connected. Use force:true to reconnect.' 
+                });
+            }
+        }
+
+        // ✅ Restore session from MongoDB
         const db = await initMongo();
         const collection = db.collection('sessions');
         const doc = await collection.findOne({ 
@@ -212,13 +288,21 @@ router.post('/connect', async (req, res) => {
         }
 
         const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
+        
+        // ✅ Clean old files if force reconnect
+        if (force === true && fs.existsSync(sessionPath)) {
+            await fs.remove(sessionPath);
+        }
+        
         await fs.ensureDir(sessionPath);
         
-        // Write saved creds to file
+        // ✅ Write saved creds to file
         await fs.writeFile(
             path.join(sessionPath, 'creds.json'), 
             doc.creds
         );
+        
+        console.log(`📂 Session restored for: ${sanitizedNumber}`);
 
         const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
         const logger = pino({ level: 'silent' });
@@ -420,6 +504,148 @@ router.get('/sessions', async (req, res) => {
         res.status(500).json({
             success: false,
             error: error.message || 'Failed to fetch sessions'
+        });
+    }
+});
+
+// ============================================
+// STEP 7: Force Re-pair (Remove old & create new)
+// ============================================
+router.post('/force-repair', async (req, res) => {
+    const { number } = req.body;
+    
+    if (!number) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Number is required' 
+        });
+    }
+
+    const sanitizedNumber = number.replace(/[^0-9]/g, '');
+    
+    try {
+        console.log(`🔄 Force re-pairing started for: ${sanitizedNumber}`);
+        
+        // Step 1: Disconnect active socket
+        if (activeSockets.has(sanitizedNumber)) {
+            const socket = activeSockets.get(sanitizedNumber);
+            try {
+                await socket.logout();
+            } catch (e) {
+                try {
+                    socket.ws.close();
+                } catch (closeErr) {
+                    console.log('Socket close error:', closeErr.message);
+                }
+            }
+            activeSockets.delete(sanitizedNumber);
+            console.log(`✅ Disconnected active socket`);
+        }
+        
+        // Step 2: Remove pending requests
+        if (pairCodeRequests.has(sanitizedNumber)) {
+            const req = pairCodeRequests.get(sanitizedNumber);
+            try {
+                req.socket.ws.close();
+            } catch (e) {}
+            pairCodeRequests.delete(sanitizedNumber);
+        }
+        
+        // Step 3: Delete from database
+        const db = await initMongo();
+        const collection = db.collection('sessions');
+        const deleteResult = await collection.deleteOne({ number: sanitizedNumber });
+        console.log(`✅ Deleted ${deleteResult.deletedCount} session(s) from DB`);
+        
+        // Step 4: Delete session files
+        const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
+        if (fs.existsSync(sessionPath)) {
+            await fs.remove(sessionPath);
+            console.log(`✅ Deleted session files`);
+        }
+        
+        // Step 5: Wait for cleanup
+        await delay(3000);
+        
+        // Step 6: Generate new pair code
+        console.log(`🔑 Generating new pair code...`);
+        
+        await fs.ensureDir(sessionPath);
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        const logger = pino({ level: 'silent' });
+
+        const socket = makeWASocket({
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
+            },
+            printQRInTerminal: false,
+            logger,
+            browser: Browsers.macOS('Safari')
+        });
+
+        pairCodeRequests.set(sanitizedNumber, { socket, sessionPath });
+
+        socket.ev.on('creds.update', async () => {
+            await saveCreds();
+            
+            const fileContent = await fs.readFile(
+                path.join(sessionPath, 'creds.json'), 
+                'utf8'
+            );
+            
+            const sessionId = uuidv4();
+            await collection.updateOne(
+                { number: sanitizedNumber },
+                {
+                    $set: {
+                        sessionId,
+                        number: sanitizedNumber,
+                        creds: fileContent,
+                        active: true,
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
+                        isNewSession: true
+                    }
+                },
+                { upsert: true }
+            );
+        });
+
+        socket.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            
+            if (connection === 'open') {
+                console.log(`✅ New session connected: ${sanitizedNumber}`);
+                pairCodeRequests.delete(sanitizedNumber);
+                activeSockets.set(sanitizedNumber, socket);
+            }
+            
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                if (statusCode === DisconnectReason.loggedOut) {
+                    await fs.remove(sessionPath);
+                    pairCodeRequests.delete(sanitizedNumber);
+                    await collection.deleteOne({ number: sanitizedNumber });
+                }
+            }
+        });
+
+        const pairCode = await socket.requestPairingCode(sanitizedNumber);
+        
+        res.status(200).json({
+            success: true,
+            number: sanitizedNumber,
+            pairCode: pairCode,
+            message: 'Old session removed. New pair code generated successfully!',
+            isForceRepair: true
+        });
+
+    } catch (error) {
+        console.error('Force re-pair error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to force re-pair'
         });
     }
 });
